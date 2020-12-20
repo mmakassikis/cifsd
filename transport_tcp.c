@@ -17,11 +17,10 @@ struct interface {
 	struct task_struct	*ksmbd_kthread;
 	struct socket		*ksmbd_socket;
 	struct list_head	entry;
-	char			*name;
 	struct mutex		sock_release_lock;
 };
 
-static LIST_HEAD(iface_list);
+static struct interface ksmbd_interface;
 
 struct tcp_transport {
 	struct ksmbd_transport		transport;
@@ -312,7 +311,7 @@ static int ksmbd_tcp_run_kthread(struct interface *iface)
 	struct task_struct *kthread;
 
 	kthread = kthread_run(ksmbd_kthread_fn, (void *)iface,
-		"ksmbd-%s", iface->name);
+		"ksmbd-listener");
 	if (IS_ERR(kthread)) {
 		rc = PTR_ERR(kthread);
 		return rc;
@@ -435,12 +434,7 @@ static void tcp_destroy_socket(struct socket *ksmbd_socket)
 		sock_release(ksmbd_socket);
 }
 
-/**
- * create_socket - create socket for ksmbd/0
- *
- * Return:	Returns a task_struct or ERR_PTR
- */
-static int create_socket(struct interface *iface)
+int ksmbd_tcp_init(void)
 {
 	int ret;
 	struct sockaddr_in6 sin6;
@@ -471,28 +465,6 @@ static int create_socket(struct interface *iface)
 	ksmbd_tcp_nodelay(ksmbd_socket);
 	ksmbd_tcp_reuseaddr(ksmbd_socket);
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
-	ret = kernel_setsockopt(ksmbd_socket,
-				SOL_SOCKET,
-				SO_BINDTODEVICE,
-				iface->name,
-				strlen(iface->name));
-#else
-	ret = sock_setsockopt(ksmbd_socket,
-			      SOL_SOCKET,
-			      SO_BINDTODEVICE,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)
-			      (char __user *)iface->name,
-#else
-			      KERNEL_SOCKPTR(iface->name),
-#endif
-			      strlen(iface->name));
-#endif
-	if (ret != -ENODEV && ret < 0) {
-		ksmbd_err("Failed to set SO_BINDTODEVICE: %d\n", ret);
-		goto out_error;
-	}
-
 	if (ipv4)
 		ret = kernel_bind(ksmbd_socket, (struct sockaddr *)&sin,
 				sizeof(sin));
@@ -513,8 +485,8 @@ static int create_socket(struct interface *iface)
 		goto out_error;
 	}
 
-	iface->ksmbd_socket = ksmbd_socket;
-	ret = ksmbd_tcp_run_kthread(iface);
+	ksmbd_interface.ksmbd_socket = ksmbd_socket;
+	ret = ksmbd_tcp_run_kthread(&ksmbd_interface);
 	if (ret) {
 		ksmbd_err("Can't start ksmbd main kthread: %d\n", ret);
 		goto out_error;
@@ -524,26 +496,7 @@ static int create_socket(struct interface *iface)
 
 out_error:
 	tcp_destroy_socket(ksmbd_socket);
-	iface->ksmbd_socket = NULL;
-	return ret;
-}
-
-int ksmbd_tcp_init(void)
-{
-	struct interface *iface;
-	struct list_head *tmp;
-	int ret;
-
-	if (list_empty(&iface_list))
-		return 0;
-
-	list_for_each(tmp, &iface_list) {
-		iface = list_entry(tmp, struct interface, entry);
-		ret = create_socket(iface);
-		if (ret)
-			break;
-	}
-
+	ksmbd_interface.ksmbd_socket = NULL;
 	return ret;
 }
 
@@ -561,91 +514,11 @@ static void tcp_stop_kthread(struct task_struct *kthread)
 
 void ksmbd_tcp_destroy(void)
 {
-	struct interface *iface, *tmp;
-
-	list_for_each_entry_safe(iface, tmp, &iface_list, entry) {
-		list_del(&iface->entry);
-		tcp_stop_kthread(iface->ksmbd_kthread);
-		mutex_lock(&iface->sock_release_lock);
-		tcp_destroy_socket(iface->ksmbd_socket);
-		iface->ksmbd_socket = NULL;
-		mutex_unlock(&iface->sock_release_lock);
-		kfree(iface->name);
-		ksmbd_free(iface);
-	}
-}
-
-static bool iface_exists(const char *ifname)
-{
-	struct net_device *netdev;
-	bool ret = false;
-
-	rcu_read_lock();
-	netdev = dev_get_by_name_rcu(&init_net, ifname);
-	if (netdev) {
-		if (!(netdev->flags & IFF_UP))
-			ksmbd_err("Device %s is down\n", ifname);
-		else
-			ret = true;
-	}
-	rcu_read_unlock();
-	return ret;
-}
-
-static int alloc_iface(char *ifname)
-{
-	struct interface *iface;
-
-	if (!ifname)
-		return -ENOMEM;
-
-	iface = ksmbd_alloc(sizeof(struct interface));
-	if (!iface) {
-		kfree(ifname);
-		return -ENOMEM;
-	}
-
-	iface->name = ifname;
-	list_add(&iface->entry, &iface_list);
-	mutex_init(&iface->sock_release_lock);
-	return 0;
-}
-
-int ksmbd_tcp_set_interfaces(char *ifc_list, int ifc_list_sz)
-{
-	int sz = 0;
-
-	if (!ifc_list_sz) {
-		struct net_device *netdev;
-
-		rtnl_lock();
-		for_each_netdev(&init_net, netdev) {
-			if (netdev->priv_flags & IFF_BRIDGE_PORT)
-				continue;
-			if (alloc_iface(kstrdup(netdev->name, GFP_KERNEL)))
-				return -ENOMEM;
-		}
-		rtnl_unlock();
-		return 0;
-	}
-
-	while (ifc_list_sz > 0) {
-		if (iface_exists(ifc_list)) {
-			if (alloc_iface(kstrdup(ifc_list, GFP_KERNEL)))
-				return -ENOMEM;
-		} else {
-			ksmbd_err("Unknown interface: %s\n", ifc_list);
-		}
-
-		sz = strlen(ifc_list);
-		if (!sz)
-			break;
-
-		ifc_list += sz + 1;
-		ifc_list_sz -= (sz + 1);
-	}
-
-	return 0;
+	tcp_stop_kthread(ksmbd_interface.ksmbd_kthread);
+	mutex_lock(&ksmbd_interface.sock_release_lock);
+	tcp_destroy_socket(ksmbd_interface.ksmbd_socket);
+	ksmbd_interface.ksmbd_socket = NULL;
+	mutex_unlock(&ksmbd_interface.sock_release_lock);
 }
 
 static struct ksmbd_transport_ops ksmbd_tcp_transport_ops = {
